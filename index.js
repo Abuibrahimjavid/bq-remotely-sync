@@ -29,8 +29,8 @@ const BASE_URL = process.env.BASE_URL;
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || "";
 
 // ─── Retry Policy ────────────────────────────────────────────────────
-const MAX_ATTEMPTS = 10;              // give up after 10 runs (~50 min)
-const WARN_AFTER_ATTEMPTS = 5;        // Slack warning fires once, at this attempt
+const MAX_ATTEMPTS = 10; // give up after 10 runs (~50 min)
+const WARN_AFTER_ATTEMPTS = 5; // Slack warning fires once, at this attempt
 const PERMANENT_HTTP_STATUSES = [400, 401, 403, 404, 405, 410, 422];
 
 // ─── Firestore Paths ─────────────────────────────────────────────────
@@ -64,7 +64,9 @@ exports.processNewRows = async (req, res) => {
       return res.status(200).send("No new rows.");
     }
 
-    let succeeded = 0, abandoned = 0, pendingRetry = 0;
+    let succeeded = 0,
+      abandoned = 0,
+      pendingRetry = 0;
 
     for (const row of rows) {
       const result = await processRow(row);
@@ -72,8 +74,8 @@ exports.processNewRows = async (req, res) => {
 
       if (result === "SUCCESS" || result === "ABANDONED") {
         await setWatermark(isoTime);
-        if (result === "SUCCESS") succeeded++; else abandoned++;
-
+        if (result === "SUCCESS") succeeded++;
+        else abandoned++;
       } else if (result === "RETRY_PENDING") {
         pendingRetry++;
         console.log(`  ⏸ Row ${row.id} pending retry. Stopping batch.`);
@@ -81,10 +83,11 @@ exports.processNewRows = async (req, res) => {
       }
     }
 
-    return res.status(200).send(
-      `✅ Processed: ${succeeded} ok, ${abandoned} abandoned, ${pendingRetry} pending-retry.`
-    );
-
+    return res
+      .status(200)
+      .send(
+        `✅ Processed: ${succeeded} ok, ${abandoned} abandoned, ${pendingRetry} pending-retry.`,
+      );
   } catch (err) {
     console.error("❌ Fatal error:", err);
     return res.status(500).send("Internal Server Error");
@@ -114,12 +117,18 @@ async function processRow(row) {
     });
     console.log(`  ✓ Delivered (attempt ${attemptCount}).`);
     return "SUCCESS";
-
-  } catch (error) {
+ } catch (error) {
     const httpStatus = error.response?.status;
+    
+    // NEW: Explicitly catch GCS 404 errors and mark them as permanent
+    const isGcsNotFound = 
+      error.message && error.message.includes("No such object");
+
     const isPermanent =
       error.isPermanent === true ||
+      isGcsNotFound || // <-- Add this line
       (httpStatus && PERMANENT_HTTP_STATUSES.includes(httpStatus));
+      
     const hitMax = attemptCount >= MAX_ATTEMPTS;
 
     if (isPermanent || hitMax) {
@@ -146,7 +155,9 @@ async function processRow(row) {
     if (attemptCount === WARN_AFTER_ATTEMPTS) {
       await sendSlack("warning", row, error, "multiple_failures", attemptCount);
     }
-    console.log(`  ↻ Transient failure (attempt ${attemptCount}/${MAX_ATTEMPTS}).`);
+    console.log(
+      `  ↻ Transient failure (attempt ${attemptCount}/${MAX_ATTEMPTS}).`,
+    );
     return "RETRY_PENDING";
   }
 }
@@ -155,7 +166,7 @@ async function deliverRow(row) {
   if (!row.snapshot_url) {
     const err = new Error("Missing snapshot_url");
     err.stage = "pre_upload";
-    err.isPermanent = true;   // ← no point retrying, skip immediately
+    err.isPermanent = true; // ← no point retrying, skip immediately
     throw err;
   }
 
@@ -167,11 +178,15 @@ async function deliverRow(row) {
     type: row.violation_type,
     detectedAt: toIsoTimestamp(row.violation_time),
     fileId,
-    extra: [{
-      confidence: row.confidence,
-      ppe_person_id: row.ppe_person_id,
-      branch_id: row.branch_id,
-    }],
+    extra: [
+      {
+        id: row.id, // <-- Added: The unique UUID from BigQuery
+        snapshot: row.snapshot, // <-- Added: The filename (e.g. no_mask_001.png)
+        confidence: row.confidence,
+        ppe_person_id: row.ppe_person_id,
+        branch_id: row.branch_id,
+      },
+    ],
   };
 
   await createViolation(payload);
@@ -184,7 +199,9 @@ async function deliverRow(row) {
 async function uploadFile(snapshotUrl) {
   const url = `${BASE_URL}/services/eye/api/v2/webhooks/files`;
 
-  const parts = snapshotUrl.replace("https://storage.googleapis.com/", "").split("/");
+  const parts = snapshotUrl
+    .replace("https://storage.googleapis.com/", "")
+    .split("/");
   const bucketName = parts.shift();
   const fileName = parts.join("/");
   const original = fileName.split("/").pop();
@@ -226,7 +243,10 @@ async function createViolation(payload) {
 // ═══════════════════════════════════════════════════════════════════════
 // AUDIT
 // ═══════════════════════════════════════════════════════════════════════
-async function writeAudit(row, { status, attemptCount, error = null, ...rest }) {
+async function writeAudit(
+  row,
+  { status, attemptCount, error = null, ...rest },
+) {
   const ref = firestore.collection(AUDIT_COLLECTION).doc(row.id);
   const existing = await ref.get();
 
@@ -261,7 +281,8 @@ function sanitizeError(error) {
     message: error.message || "Unknown error",
     stage: error.stage || null,
     httpStatus: error.response?.status || null,
-    errorCode: error.response?.data?.code || error.response?.data?.errorCode || null,
+    errorCode:
+      error.response?.data?.code || error.response?.data?.errorCode || null,
     endpoint: error.config?.url || null,
     responseBody: error.response?.data
       ? JSON.stringify(error.response.data).substring(0, 2000)
@@ -280,28 +301,50 @@ async function sendSlack(severity, row, error, reason, attemptCount = null) {
 
   const emoji = severity === "critical" ? "🔴" : "🟡";
   const titleMap = {
-    permanent_error:      "Row ABANDONED — permanent API error",
+    permanent_error: "Row ABANDONED — permanent API error",
     max_attempts_reached: `Row ABANDONED — ${MAX_ATTEMPTS} attempts exhausted`,
-    multiple_failures:    `Row failed ${attemptCount} times — will retry`,
+    multiple_failures: `Row failed ${attemptCount} times — will retry`,
   };
 
   const fields = [
-    { title: "Row ID",   value: row.id,                             short: true },
-    { title: "Camera",   value: String(row.camera_id),              short: true },
-    { title: "Type",     value: row.violation_type,                 short: true },
-    { title: "Detected", value: toIsoTimestamp(row.violation_time), short: true },
+    { title: "Row ID", value: row.id, short: true },
+    { title: "Camera", value: String(row.camera_id), short: true },
+    { title: "Type", value: row.violation_type, short: true },
+    {
+      title: "Detected",
+      value: toIsoTimestamp(row.violation_time),
+      short: true,
+    },
   ];
   if (error) {
-    fields.push({ title: "Stage", value: error.stage || "unknown", short: true });
-    fields.push({ title: "HTTP",  value: String(error.response?.status || "N/A"), short: true });
-    fields.push({ title: "Error", value: (error.message || "").substring(0, 300), short: false });
+    fields.push({
+      title: "Stage",
+      value: error.stage || "unknown",
+      short: true,
+    });
+    fields.push({
+      title: "HTTP",
+      value: String(error.response?.status || "N/A"),
+      short: true,
+    });
+    fields.push({
+      title: "Error",
+      value: (error.message || "").substring(0, 300),
+      short: false,
+    });
   }
 
   try {
-    await axios.post(SLACK_WEBHOOK_URL, {
-      text: `${emoji} *${titleMap[reason] || reason}* — Row \`${row.id}\``,
-      attachments: [{ color: severity === "critical" ? "#D93F3F" : "#F2C744", fields }],
-    }, { timeout: 5000 });
+    await axios.post(
+      SLACK_WEBHOOK_URL,
+      {
+        text: `${emoji} *${titleMap[reason] || reason}* — Row \`${row.id}\``,
+        attachments: [
+          { color: severity === "critical" ? "#D93F3F" : "#F2C744", fields },
+        ],
+      },
+      { timeout: 5000 },
+    );
   } catch (err) {
     console.error("Slack failed:", err.message);
   }
@@ -316,7 +359,10 @@ async function getWatermark() {
 
   if (!doc.exists) {
     const initial = "1970-01-01T00:00:00.000Z";
-    await ref.set({ lastProcessedTimestamp: initial, updatedAt: new Date().toISOString() });
+    await ref.set({
+      lastProcessedTimestamp: initial,
+      updatedAt: new Date().toISOString(),
+    });
     return initial;
   }
 
@@ -327,11 +373,16 @@ async function getWatermark() {
 }
 
 async function setWatermark(timestamp) {
-  const iso = typeof timestamp === "string" ? timestamp : new Date(timestamp).toISOString();
-  await firestore.doc(STATE_DOC_PATH).set(
-    { lastProcessedTimestamp: iso, updatedAt: new Date().toISOString() },
-    { merge: true }
-  );
+  const iso =
+    typeof timestamp === "string"
+      ? timestamp
+      : new Date(timestamp).toISOString();
+  await firestore
+    .doc(STATE_DOC_PATH)
+    .set(
+      { lastProcessedTimestamp: iso, updatedAt: new Date().toISOString() },
+      { merge: true },
+    );
   console.log(`💾 Watermark → ${iso}`);
 }
 
@@ -340,7 +391,11 @@ async function setWatermark(timestamp) {
 // ═══════════════════════════════════════════════════════════════════════
 function toIsoTimestamp(rawValue) {
   if (rawValue == null) throw new Error("Timestamp is null");
-  if (typeof rawValue === "object" && !(rawValue instanceof Date) && "value" in rawValue) {
+  if (
+    typeof rawValue === "object" &&
+    !(rawValue instanceof Date) &&
+    "value" in rawValue
+  ) {
     return toIsoTimestamp(rawValue.value);
   }
   if (rawValue instanceof Date) return rawValue.toISOString();
