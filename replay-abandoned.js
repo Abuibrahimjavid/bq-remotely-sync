@@ -73,35 +73,44 @@ async function main() {
       type: row.violation_type,
       detectedAt: toIsoTimestamp(row.violation_time),
       fileId,
-      extra: [{
-        id: row.id,                // <-- Added: To match index.js
-        snapshot: row.snapshot,    // <-- Added: To match index.js
-        confidence: row.confidence,
-        ppe_person_id: row.ppe_person_id,
-        branch_id: row.branch_id,
-      }],
+      extra: [
+        {
+          id: row.id, // <-- Added: To match index.js
+          snapshot: row.snapshot, // <-- Added: To match index.js
+          camera_id: row.camera_id, // <-- ADDED
+          confidence: row.confidence,
+          ppe_person_id: row.ppe_person_id,
+          branch_id: row.branch_id,
+        },
+      ],
     });
     console.log(`  ✓ Violation created.`);
 
-    await auditRef.set({
-      status: "SUCCESS",
-      resolvedAt: new Date().toISOString(),
-      resolvedBy: "manual_replay",
-      error: null,
-    }, { merge: true });
+    await auditRef.set(
+      {
+        status: "SUCCESS",
+        resolvedAt: new Date().toISOString(),
+        resolvedBy: "manual_replay",
+        error: null,
+      },
+      { merge: true },
+    );
 
     console.log(`✅ Row ${ROW_ID} marked SUCCESS.`);
   } catch (err) {
     console.error(`❌ Replay failed: ${err.message}`);
-    await auditRef.set({
-      status: "ABANDONED",
-      error: {
-        message: err.message,
-        httpStatus: err.response?.status || null,
+    await auditRef.set(
+      {
+        status: "ABANDONED",
+        error: {
+          message: err.message,
+          httpStatus: err.response?.status || null,
+        },
+        abandonReason: "manual_replay_failed",
+        lastAttemptAt: new Date().toISOString(),
       },
-      abandonReason: "manual_replay_failed",
-      lastAttemptAt: new Date().toISOString(),
-    }, { merge: true });
+      { merge: true },
+    );
     process.exit(1);
   }
 }
@@ -109,7 +118,9 @@ async function main() {
 // ─── Shared helpers (duplicated on purpose) ──────────────────────────
 async function uploadFile(snapshotUrl) {
   const url = `${BASE_URL}/services/eye/api/v2/webhooks/files`;
-  const parts = snapshotUrl.replace("https://storage.googleapis.com/", "").split("/");
+  const parts = snapshotUrl
+    .replace("https://storage.googleapis.com/", "")
+    .split("/");
   const bucketName = parts.shift();
   const fileName = parts.join("/");
   const original = fileName.split("/").pop();
@@ -150,7 +161,11 @@ async function createViolation(payload) {
 
 function toIsoTimestamp(rawValue) {
   if (rawValue == null) throw new Error("Timestamp is null");
-  if (typeof rawValue === "object" && !(rawValue instanceof Date) && "value" in rawValue) {
+  if (
+    typeof rawValue === "object" &&
+    !(rawValue instanceof Date) &&
+    "value" in rawValue
+  ) {
     return toIsoTimestamp(rawValue.value);
   }
   if (rawValue instanceof Date) return rawValue.toISOString();
@@ -165,4 +180,7 @@ function toIsoTimestamp(rawValue) {
   throw new Error(`Cannot parse timestamp: ${JSON.stringify(rawValue)}`);
 }
 
-main().catch((err) => { console.error(err); process.exit(1); });
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

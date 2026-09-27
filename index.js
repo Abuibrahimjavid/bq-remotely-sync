@@ -3,8 +3,7 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 // ADD THIS LINE AT THE VERY TOP, AFTER THE DOTENV REQUIRE
-require('events').EventEmitter.defaultMaxListeners = 20;
-
+require("events").EventEmitter.defaultMaxListeners = 20;
 
 const { BigQuery } = require("@google-cloud/bigquery");
 const { Storage } = require("@google-cloud/storage");
@@ -189,6 +188,7 @@ async function deliverRow(row) {
       {
         id: row.id, // <-- Added: The unique UUID from BigQuery
         snapshot: row.snapshot, // <-- Added: The filename (e.g. no_mask_001.png)
+        camera_id: row.camera_id, // <-- ADDED
         confidence: row.confidence,
         ppe_person_id: row.ppe_person_id,
         branch_id: row.branch_id,
