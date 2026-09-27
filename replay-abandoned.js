@@ -74,6 +74,8 @@ async function main() {
       detectedAt: toIsoTimestamp(row.violation_time),
       fileId,
       extra: [{
+        id: row.id,                // <-- Added: To match index.js
+        snapshot: row.snapshot,    // <-- Added: To match index.js
         confidence: row.confidence,
         ppe_person_id: row.ppe_person_id,
         branch_id: row.branch_id,

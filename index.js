@@ -2,6 +2,10 @@ if (process.env.NODE_ENV !== "production") {
   require("dotenv").config();
 }
 
+// ADD THIS LINE AT THE VERY TOP, AFTER THE DOTENV REQUIRE
+require('events').EventEmitter.defaultMaxListeners = 20;
+
+
 const { BigQuery } = require("@google-cloud/bigquery");
 const { Storage } = require("@google-cloud/storage");
 const { Firestore } = require("@google-cloud/firestore");
@@ -81,6 +85,8 @@ exports.processNewRows = async (req, res) => {
         console.log(`  ⏸ Row ${row.id} pending retry. Stopping batch.`);
         break;
       }
+      // ADD THIS LINE RIGHT HERE, AT THE END OF THE LOOP
+      await new Promise((resolve) => setTimeout(resolve, 200));
     }
 
     return res
@@ -117,18 +123,18 @@ async function processRow(row) {
     });
     console.log(`  ✓ Delivered (attempt ${attemptCount}).`);
     return "SUCCESS";
- } catch (error) {
+  } catch (error) {
     const httpStatus = error.response?.status;
-    
+
     // NEW: Explicitly catch GCS 404 errors and mark them as permanent
-    const isGcsNotFound = 
+    const isGcsNotFound =
       error.message && error.message.includes("No such object");
 
     const isPermanent =
       error.isPermanent === true ||
       isGcsNotFound || // <-- Add this line
       (httpStatus && PERMANENT_HTTP_STATUSES.includes(httpStatus));
-      
+
     const hitMax = attemptCount >= MAX_ATTEMPTS;
 
     if (isPermanent || hitMax) {
