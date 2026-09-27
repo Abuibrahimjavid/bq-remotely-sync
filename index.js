@@ -38,8 +38,9 @@ const WARN_AFTER_ATTEMPTS = 5; // Slack warning fires once, at this attempt
 const PERMANENT_HTTP_STATUSES = [400, 401, 403, 404, 405, 410, 422];
 
 // ─── Firestore Paths ─────────────────────────────────────────────────
-const STATE_DOC_PATH = "pipeline_state/sync_job";
-const AUDIT_COLLECTION = "sync_audit";
+// ─── Firestore Paths (configurable via env vars per module) ──────────
+const STATE_DOC_PATH = process.env.STATE_DOC_PATH || "pipeline_state/sync_job";
+const AUDIT_COLLECTION = process.env.AUDIT_COLLECTION || "sync_audit";
 
 // ═══════════════════════════════════════════════════════════════════════
 // ENTRY POINT

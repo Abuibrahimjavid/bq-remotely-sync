@@ -22,7 +22,7 @@ const CLIENT_KEY = process.env.CLIENT_KEY;
 const EDGE_ID = process.env.EDGE_ID;
 const BASE_URL = process.env.BASE_URL;
 
-const AUDIT_COLLECTION = "sync_audit";
+const AUDIT_COLLECTION = process.env.AUDIT_COLLECTION || "sync_audit";
 
 const ROW_ID = process.argv[2];
 
