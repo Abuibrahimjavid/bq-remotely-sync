@@ -2,7 +2,6 @@ if (process.env.NODE_ENV !== "production") {
   require("dotenv").config();
 }
 
-// ADD THIS LINE AT THE VERY TOP, AFTER THE DOTENV REQUIRE
 require("events").EventEmitter.defaultMaxListeners = 20;
 
 const { BigQuery } = require("@google-cloud/bigquery");
@@ -22,62 +21,100 @@ const bigquery = new BigQuery();
 const storage = new Storage();
 const firestore = new Firestore();
 
-// ─── Config ──────────────────────────────────────────────────────────
+// ─── Shared Config ───────────────────────────────────────────────────
 const PROJECT_ID = process.env.PROJECT_ID;
 const DATASET_ID = process.env.DATASET_ID;
-const TABLE_ID = process.env.TABLE_ID;
 const CLIENT_KEY = process.env.CLIENT_KEY;
 const EDGE_ID = process.env.EDGE_ID;
 const BASE_URL = process.env.BASE_URL;
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || "";
 
-// ─── Retry Policy ────────────────────────────────────────────────────
-const MAX_ATTEMPTS = 10; // give up after 10 runs (~50 min)
-const WARN_AFTER_ATTEMPTS = 5; // Slack warning fires once, at this attempt
+const MAX_ATTEMPTS = 10;
+const WARN_AFTER_ATTEMPTS = 5;
 const PERMANENT_HTTP_STATUSES = [400, 401, 403, 404, 405, 410, 422];
 
-// ─── Firestore Paths ─────────────────────────────────────────────────
-// ─── Firestore Paths (configurable via env vars per module) ──────────
-const STATE_DOC_PATH = process.env.STATE_DOC_PATH || "pipeline_state/sync_job";
-const AUDIT_COLLECTION = process.env.AUDIT_COLLECTION || "sync_audit";
+// ═══════════════════════════════════════════════════════════════════════
+// DATASET CONFIG MAP — one entry per table
+// ═══════════════════════════════════════════════════════════════════════
+const DATASET_CONFIG = {
+  ppe: {
+    tableId: "namaq_ppe",
+    stateDocPath: "pipeline_state/ppe_job",
+    auditCollection: "sync_audit_ppe",
+    timeField: "violation_time",
+    typeValue: "PPE",
+    hasImage: true,
+    selectFields: [
+      "id", "branch_id", "camera_id", "ppe_person_id", "violation_type",
+      "violation_time", "confidence", "snapshot", "snapshot_url",
+    ],
+    extraFields: [
+      "ppe_person_id", "violation_type", "confidence", "snapshot",
+      "camera_id", "branch_id",
+    ],
+  },
+  footfall: {
+    tableId: "namaq_footfall",
+    stateDocPath: "pipeline_state/footfall_job",
+    auditCollection: "sync_audit_footfall",
+    timeField: "event_time",
+    typeValue: "FOOTFALL",
+    hasImage: false,
+    selectFields: ["id", "branch_id", "camera_id", "track_id", "direction", "event_time"],
+    extraFields: ["track_id", "direction", "camera_id", "branch_id"],
+  },
+  heatmap: {
+    tableId: "namaq_heatmap",
+    stateDocPath: "pipeline_state/heatmap_job",
+    auditCollection: "sync_audit_heatmap",
+    timeField: "event_time",
+    typeValue: "HEATMAP",
+    hasImage: false,
+    selectFields: ["id", "branch_id", "camera_id", "x", "y", "track_id", "event_time"],
+    extraFields: ["x", "y", "track_id", "camera_id", "branch_id"],
+  },
+};
 
 // ═══════════════════════════════════════════════════════════════════════
 // ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════
 exports.processNewRows = async (req, res) => {
   try {
-    console.log("🚀 Starting BigQuery to Eye API sync...");
+    const mode = ((req.query && req.query.mode) || "ppe").toLowerCase();
+    const config = DATASET_CONFIG[mode];
 
-    const watermark = await getWatermark();
+    if (!config) {
+      return res.status(400).send(`Invalid mode. Use: ${Object.keys(DATASET_CONFIG).join(" | ")}`);
+    }
+
+    console.log(`🚀 Starting ${mode.toUpperCase()} sync from ${config.tableId}...`);
+
+    const watermark = await getWatermark(config.stateDocPath);
     console.log(`📅 Watermark: ${watermark}`);
 
+    const selectList = config.selectFields.join(", ");
     const [rows] = await bigquery.query({
       query: `
-        SELECT id, branch_id, camera_id, ppe_person_id, violation_type,
-               violation_time, confidence, snapshot, snapshot_url
-        FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLE_ID}\`
-        WHERE violation_time > @watermark
-        ORDER BY violation_time ASC
+        SELECT ${selectList}
+        FROM \`${PROJECT_ID}.${DATASET_ID}.${config.tableId}\`
+        WHERE ${config.timeField} > @watermark
+        ORDER BY ${config.timeField} ASC
         LIMIT 50
       `,
       params: { watermark: new Date(watermark) },
     });
 
     console.log(`📊 Found ${rows.length} rows.`);
-    if (rows.length === 0) {
-      return res.status(200).send("No new rows.");
-    }
+    if (rows.length === 0) return res.status(200).send("No new rows.");
 
-    let succeeded = 0,
-      abandoned = 0,
-      pendingRetry = 0;
+    let succeeded = 0, abandoned = 0, pendingRetry = 0;
 
     for (const row of rows) {
-      const result = await processRow(row);
-      const isoTime = toIsoTimestamp(row.violation_time);
+      const result = await processRow(row, config);
+      const isoTime = toIsoTimestamp(row[config.timeField]);
 
       if (result === "SUCCESS" || result === "ABANDONED") {
-        await setWatermark(isoTime);
+        await setWatermark(config.stateDocPath, isoTime);
         if (result === "SUCCESS") succeeded++;
         else abandoned++;
       } else if (result === "RETRY_PENDING") {
@@ -85,15 +122,13 @@ exports.processNewRows = async (req, res) => {
         console.log(`  ⏸ Row ${row.id} pending retry. Stopping batch.`);
         break;
       }
-      // ADD THIS LINE RIGHT HERE, AT THE END OF THE LOOP
+
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
 
-    return res
-      .status(200)
-      .send(
-        `✅ Processed: ${succeeded} ok, ${abandoned} abandoned, ${pendingRetry} pending-retry.`,
-      );
+    return res.status(200).send(
+      `✅ ${mode.toUpperCase()} Processed: ${succeeded} ok, ${abandoned} abandoned, ${pendingRetry} pending-retry.`
+    );
   } catch (err) {
     console.error("❌ Fatal error:", err);
     return res.status(500).send("Internal Server Error");
@@ -103,19 +138,16 @@ exports.processNewRows = async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════
 // ROW PROCESSING
 // ═══════════════════════════════════════════════════════════════════════
-/**
- * Returns: "SUCCESS" | "ABANDONED" | "RETRY_PENDING"
- */
-async function processRow(row) {
+async function processRow(row, config) {
   console.log(`🔹 Row ${row.id}`);
 
-  const existingAudit = await getAuditDoc(row.id);
+  const existingAudit = await getAuditDoc(config.auditCollection, row.id);
   const previousAttempts = existingAudit?.attemptCount || 0;
   const attemptCount = previousAttempts + 1;
 
   try {
-    await deliverRow(row);
-    await writeAudit(row, {
+    await deliverRow(row, config);
+    await writeAudit(row, config, {
       status: "SUCCESS",
       attemptCount,
       resolvedAt: new Date().toISOString(),
@@ -125,90 +157,79 @@ async function processRow(row) {
     return "SUCCESS";
   } catch (error) {
     const httpStatus = error.response?.status;
-
-    // NEW: Explicitly catch GCS 404 errors and mark them as permanent
-    const isGcsNotFound =
-      error.message && error.message.includes("No such object");
-
+    const isGcsNotFound = error.message && error.message.includes("No such object");
     const isPermanent =
       error.isPermanent === true ||
-      isGcsNotFound || // <-- Add this line
+      isGcsNotFound ||
       (httpStatus && PERMANENT_HTTP_STATUSES.includes(httpStatus));
-
     const hitMax = attemptCount >= MAX_ATTEMPTS;
 
     if (isPermanent || hitMax) {
       const reason = isPermanent ? "permanent_error" : "max_attempts_reached";
-      await writeAudit(row, {
+      await writeAudit(row, config, {
         status: "ABANDONED",
         attemptCount,
         abandonedAt: new Date().toISOString(),
         error: sanitizeError(error),
         abandonReason: reason,
       });
-      await sendSlack("critical", row, error, reason, attemptCount);
+      await sendSlack("critical", row, config, error, reason, attemptCount);
       console.log(`  ⛔ Abandoned (${reason}).`);
       return "ABANDONED";
     }
 
-    await writeAudit(row, {
+    await writeAudit(row, config, {
       status: "PENDING_RETRY",
       attemptCount,
       error: sanitizeError(error),
     });
-
-    // Warn only once, exactly at WARN_AFTER_ATTEMPTS — not on every attempt after
     if (attemptCount === WARN_AFTER_ATTEMPTS) {
-      await sendSlack("warning", row, error, "multiple_failures", attemptCount);
+      await sendSlack("warning", row, config, error, "multiple_failures", attemptCount);
     }
-    console.log(
-      `  ↻ Transient failure (attempt ${attemptCount}/${MAX_ATTEMPTS}).`,
-    );
+    console.log(`  ↻ Transient failure (attempt ${attemptCount}/${MAX_ATTEMPTS}).`);
     return "RETRY_PENDING";
   }
 }
 
-async function deliverRow(row) {
-  if (!row.snapshot_url) {
-    const err = new Error("Missing snapshot_url");
-    err.stage = "pre_upload";
-    err.isPermanent = true; // ← no point retrying, skip immediately
-    throw err;
+async function deliverRow(row, config) {
+  let fileId = "";
+
+  if (config.hasImage) {
+    if (!row.snapshot_url) {
+      const err = new Error("Missing snapshot_url");
+      err.stage = "pre_upload";
+      err.isPermanent = true;
+      throw err;
+    }
+    fileId = await uploadFile(row.snapshot_url);
+    console.log(`  ✓ Uploaded: ${fileId}`);
+  } else {
+    console.log(`  ℹ No image for ${config.typeValue}, skipping upload.`);
   }
 
-  const fileId = await uploadFile(row.snapshot_url);
-  console.log(`  ✓ Uploaded: ${fileId}`);
+  const extraPayload = { id: row.id };
+  for (const field of config.extraFields) {
+    extraPayload[field] = row[field];
+  }
 
   const payload = {
-    cameraId: EDGE_ID, // <-- Use EDGE_ID instead of row.camera_id
-    type: row.violation_type,
-    detectedAt: toIsoTimestamp(row.violation_time),
-    fileId,
-    extra: [
-      {
-        id: row.id, // <-- Added: The unique UUID from BigQuery
-        snapshot: row.snapshot, // <-- Added: The filename (e.g. no_mask_001.png)
-        camera_id: row.camera_id, // <-- ADDED
-        confidence: row.confidence,
-        ppe_person_id: row.ppe_person_id,
-        branch_id: row.branch_id,
-      },
-    ],
+    cameraId: EDGE_ID,
+    type: config.typeValue,
+    detectedAt: toIsoTimestamp(row[config.timeField]),
+    fileId: fileId,
+    extra: [extraPayload],
   };
 
   await createViolation(payload);
-  console.log(`  ✓ Violation created.`);
+  console.log(`  ✓ ${config.typeValue} violation created.`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// API CALLS
+// API CALLS (unchanged)
 // ═══════════════════════════════════════════════════════════════════════
 async function uploadFile(snapshotUrl) {
   const url = `${BASE_URL}/services/eye/api/v2/webhooks/files`;
-
-  const parts = snapshotUrl
-    .replace("https://storage.googleapis.com/", "")
-    .split("/");
+  const parts = snapshotUrl.replace("https://storage.googleapis.com/", "").split("/");
   const bucketName = parts.shift();
   const fileName = parts.join("/");
   const original = fileName.split("/").pop();
@@ -223,11 +244,7 @@ async function uploadFile(snapshotUrl) {
   });
 
   const res = await axios.post(url, form, {
-    headers: {
-      ...form.getHeaders(),
-      "x-client-key": CLIENT_KEY,
-      edgeId: EDGE_ID,
-    },
+    headers: { ...form.getHeaders(), "x-client-key": CLIENT_KEY, edgeId: EDGE_ID },
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
   });
@@ -248,21 +265,17 @@ async function createViolation(payload) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// AUDIT
+// AUDIT (now takes config + auditCollection)
 // ═══════════════════════════════════════════════════════════════════════
-async function writeAudit(
-  row,
-  { status, attemptCount, error = null, ...rest },
-) {
-  const ref = firestore.collection(AUDIT_COLLECTION).doc(row.id);
+async function writeAudit(row, config, { status, attemptCount, error = null, ...rest }) {
+  const ref = firestore.collection(config.auditCollection).doc(row.id);
   const existing = await ref.get();
 
   const data = {
     rowId: row.id,
     cameraId: row.camera_id,
-    violationType: row.violation_type,
-    detectedAt: toIsoTimestamp(row.violation_time),
-    snapshotUrl: row.snapshot_url || null,
+    moduleType: config.typeValue,
+    detectedAt: toIsoTimestamp(row[config.timeField]),
     branchId: row.branch_id,
     status,
     attemptCount,
@@ -271,15 +284,12 @@ async function writeAudit(
     ...rest,
   };
 
-  if (!existing.exists) {
-    data.firstAttemptAt = data.lastAttemptAt;
-  }
-
+  if (!existing.exists) data.firstAttemptAt = data.lastAttemptAt;
   await ref.set(data, { merge: true });
 }
 
-async function getAuditDoc(rowId) {
-  const doc = await firestore.collection(AUDIT_COLLECTION).doc(rowId).get();
+async function getAuditDoc(collection, rowId) {
+  const doc = await firestore.collection(collection).doc(rowId).get();
   return doc.exists ? doc.data() : null;
 }
 
@@ -288,108 +298,70 @@ function sanitizeError(error) {
     message: error.message || "Unknown error",
     stage: error.stage || null,
     httpStatus: error.response?.status || null,
-    errorCode:
-      error.response?.data?.code || error.response?.data?.errorCode || null,
+    errorCode: error.response?.data?.code || error.response?.data?.errorCode || null,
     endpoint: error.config?.url || null,
-    responseBody: error.response?.data
-      ? JSON.stringify(error.response.data).substring(0, 2000)
-      : null,
+    responseBody: error.response?.data ? JSON.stringify(error.response.data).substring(0, 2000) : null,
   };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // SLACK
 // ═══════════════════════════════════════════════════════════════════════
-async function sendSlack(severity, row, error, reason, attemptCount = null) {
+async function sendSlack(severity, row, config, error, reason, attemptCount = null) {
   if (!SLACK_WEBHOOK_URL) {
     console.log(`  [Slack disabled] ${severity}: ${row.id} — ${reason}`);
     return;
   }
-
   const emoji = severity === "critical" ? "🔴" : "🟡";
   const titleMap = {
     permanent_error: "Row ABANDONED — permanent API error",
     max_attempts_reached: `Row ABANDONED — ${MAX_ATTEMPTS} attempts exhausted`,
     multiple_failures: `Row failed ${attemptCount} times — will retry`,
   };
-
   const fields = [
     { title: "Row ID", value: row.id, short: true },
-    { title: "Camera", value: String(row.camera_id), short: true },
-    { title: "Type", value: row.violation_type, short: true },
-    {
-      title: "Detected",
-      value: toIsoTimestamp(row.violation_time),
-      short: true,
-    },
+    { title: "Module", value: config.typeValue, short: true },
+    { title: "Type", value: config.typeValue, short: true },
+    { title: "Detected", value: toIsoTimestamp(row[config.timeField]), short: true },
   ];
   if (error) {
-    fields.push({
-      title: "Stage",
-      value: error.stage || "unknown",
-      short: true,
-    });
-    fields.push({
-      title: "HTTP",
-      value: String(error.response?.status || "N/A"),
-      short: true,
-    });
-    fields.push({
-      title: "Error",
-      value: (error.message || "").substring(0, 300),
-      short: false,
-    });
+    fields.push({ title: "Stage", value: error.stage || "unknown", short: true });
+    fields.push({ title: "HTTP", value: String(error.response?.status || "N/A"), short: true });
+    fields.push({ title: "Error", value: (error.message || "").substring(0, 300), short: false });
   }
-
   try {
-    await axios.post(
-      SLACK_WEBHOOK_URL,
-      {
-        text: `${emoji} *${titleMap[reason] || reason}* — Row \`${row.id}\``,
-        attachments: [
-          { color: severity === "critical" ? "#D93F3F" : "#F2C744", fields },
-        ],
-      },
-      { timeout: 5000 },
-    );
+    await axios.post(SLACK_WEBHOOK_URL, {
+      text: `${emoji} *${titleMap[reason] || reason}* — Row \`${row.id}\``,
+      attachments: [{ color: severity === "critical" ? "#D93F3F" : "#F2C744", fields }],
+    }, { timeout: 5000 });
   } catch (err) {
     console.error("Slack failed:", err.message);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// WATERMARK
+// WATERMARK (now takes doc path)
 // ═══════════════════════════════════════════════════════════════════════
-async function getWatermark() {
-  const ref = firestore.doc(STATE_DOC_PATH);
+async function getWatermark(stateDocPath) {
+  const ref = firestore.doc(stateDocPath);
   const doc = await ref.get();
-
   if (!doc.exists) {
     const initial = "1970-01-01T00:00:00.000Z";
-    await ref.set({
-      lastProcessedTimestamp: initial,
-      updatedAt: new Date().toISOString(),
-    });
+    await ref.set({ lastProcessedTimestamp: initial, updatedAt: new Date().toISOString() });
     return initial;
   }
-
   const stored = doc.data().lastProcessedTimestamp;
   if (typeof stored === "string") return stored;
   if (stored?.toDate) return stored.toDate().toISOString();
   return new Date(stored).toISOString();
 }
 
-async function setWatermark(timestamp) {
-  const iso =
-    typeof timestamp === "string"
-      ? timestamp
-      : new Date(timestamp).toISOString();
-  await firestore
-    .doc(STATE_DOC_PATH)
-    .set(
-      { lastProcessedTimestamp: iso, updatedAt: new Date().toISOString() },
-      { merge: true },
-    );
+async function setWatermark(stateDocPath, timestamp) {
+  const iso = typeof timestamp === "string" ? timestamp : new Date(timestamp).toISOString();
+  await firestore.doc(stateDocPath).set(
+    { lastProcessedTimestamp: iso, updatedAt: new Date().toISOString() },
+    { merge: true }
+  );
   console.log(`💾 Watermark → ${iso}`);
 }
 
@@ -398,11 +370,7 @@ async function setWatermark(timestamp) {
 // ═══════════════════════════════════════════════════════════════════════
 function toIsoTimestamp(rawValue) {
   if (rawValue == null) throw new Error("Timestamp is null");
-  if (
-    typeof rawValue === "object" &&
-    !(rawValue instanceof Date) &&
-    "value" in rawValue
-  ) {
+  if (typeof rawValue === "object" && !(rawValue instanceof Date) && "value" in rawValue) {
     return toIsoTimestamp(rawValue.value);
   }
   if (rawValue instanceof Date) return rawValue.toISOString();

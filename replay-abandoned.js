@@ -17,25 +17,69 @@ const firestore = new Firestore();
 
 const PROJECT_ID = process.env.PROJECT_ID;
 const DATASET_ID = process.env.DATASET_ID;
-const TABLE_ID = process.env.TABLE_ID;
 const CLIENT_KEY = process.env.CLIENT_KEY;
 const EDGE_ID = process.env.EDGE_ID;
 const BASE_URL = process.env.BASE_URL;
 
-const AUDIT_COLLECTION = process.env.AUDIT_COLLECTION || "sync_audit";
+// ═══════════════════════════════════════════════════════════════════════
+// Same DATASET_CONFIG as index.js — duplicated for self-containment
+// ═══════════════════════════════════════════════════════════════════════
+const DATASET_CONFIG = {
+  ppe: {
+    tableId: "namaq_ppe",
+    auditCollection: "sync_audit_ppe",
+    timeField: "violation_time",
+    typeValue: "PPE",
+    hasImage: true,
+    selectFields: [
+      "id", "branch_id", "camera_id", "ppe_person_id", "violation_type",
+      "violation_time", "confidence", "snapshot", "snapshot_url",
+    ],
+    extraFields: [
+      "ppe_person_id", "violation_type", "confidence", "snapshot",
+      "camera_id", "branch_id",
+    ],
+  },
+  footfall: {
+    tableId: "namaq_footfall",
+    auditCollection: "sync_audit_footfall",
+    timeField: "event_time",
+    typeValue: "FOOTFALL",
+    hasImage: false,
+    selectFields: ["id", "branch_id", "camera_id", "track_id", "direction", "event_time"],
+    extraFields: ["track_id", "direction", "camera_id", "branch_id"],
+  },
+  heatmap: {
+    tableId: "namaq_heatmap",
+    auditCollection: "sync_audit_heatmap",
+    timeField: "event_time",
+    typeValue: "HEATMAP",
+    hasImage: false,
+    selectFields: ["id", "branch_id", "camera_id", "x", "y", "track_id", "event_time"],
+    extraFields: ["x", "y", "track_id", "camera_id", "branch_id"],
+  },
+};
 
 const ROW_ID = process.argv[2];
+const MODE = (process.argv[3] || "").toLowerCase();
 
 async function main() {
-  if (!ROW_ID) {
-    console.error("Usage: node replay-abandoned.js <rowId>");
+  if (!ROW_ID || !MODE) {
+    console.error("Usage: node replay-abandoned.js <rowId> <mode>");
+    console.error("Modes: ppe | footfall | heatmap");
     process.exit(1);
   }
 
-  const auditRef = firestore.collection(AUDIT_COLLECTION).doc(ROW_ID);
+  const config = DATASET_CONFIG[MODE];
+  if (!config) {
+    console.error(`Invalid mode "${MODE}". Use: ppe | footfall | heatmap`);
+    process.exit(1);
+  }
+
+  const auditRef = firestore.collection(config.auditCollection).doc(ROW_ID);
   const auditDoc = await auditRef.get();
   if (!auditDoc.exists) {
-    console.error(`No audit record for ${ROW_ID}`);
+    console.error(`No audit record for ${ROW_ID} in ${config.auditCollection}`);
     process.exit(1);
   }
 
@@ -45,46 +89,50 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`Replaying row ${ROW_ID}...`);
+  console.log(`Replaying ${MODE.toUpperCase()} row ${ROW_ID}...`);
 
+  const selectList = config.selectFields.join(", ");
   const [rows] = await bigquery.query({
     query: `
-      SELECT id, branch_id, camera_id, ppe_person_id, violation_type,
-             violation_time, confidence, snapshot, snapshot_url
-      FROM \`${PROJECT_ID}.${DATASET_ID}.${TABLE_ID}\`
+      SELECT ${selectList}
+      FROM \`${PROJECT_ID}.${DATASET_ID}.${config.tableId}\`
       WHERE id = @rowId LIMIT 1
     `,
     params: { rowId: ROW_ID },
   });
 
   if (rows.length === 0) {
-    console.error(`Row not found in BigQuery.`);
+    console.error(`Row not found in ${config.tableId}.`);
     process.exit(1);
   }
 
   const row = rows[0];
 
   try {
-    const fileId = await uploadFile(row.snapshot_url);
-    console.log(`  ✓ Uploaded: ${fileId}`);
+    let fileId = "";
+    if (config.hasImage) {
+      if (!row.snapshot_url) {
+        throw new Error("Missing snapshot_url");
+      }
+      fileId = await uploadFile(row.snapshot_url);
+      console.log(`  ✓ Uploaded: ${fileId}`);
+    } else {
+      console.log(`  ℹ No image for ${config.typeValue}, skipping upload.`);
+    }
+
+    const extraPayload = { id: row.id };
+    for (const field of config.extraFields) {
+      extraPayload[field] = row[field];
+    }
 
     await createViolation({
       cameraId: EDGE_ID,
-      type: row.violation_type,
-      detectedAt: toIsoTimestamp(row.violation_time),
-      fileId,
-      extra: [
-        {
-          id: row.id, // <-- Added: To match index.js
-          snapshot: row.snapshot, // <-- Added: To match index.js
-          camera_id: row.camera_id, // <-- ADDED
-          confidence: row.confidence,
-          ppe_person_id: row.ppe_person_id,
-          branch_id: row.branch_id,
-        },
-      ],
+      type: config.typeValue,
+      detectedAt: toIsoTimestamp(row[config.timeField]),
+      fileId: fileId,
+      extra: [extraPayload],
     });
-    console.log(`  ✓ Violation created.`);
+    console.log(`  ✓ ${config.typeValue} violation created.`);
 
     await auditRef.set(
       {
@@ -115,7 +163,7 @@ async function main() {
   }
 }
 
-// ─── Shared helpers (duplicated on purpose) ──────────────────────────
+// ─── Shared helpers ──────────────────────────────────────────────────
 async function uploadFile(snapshotUrl) {
   const url = `${BASE_URL}/services/eye/api/v2/webhooks/files`;
   const parts = snapshotUrl
