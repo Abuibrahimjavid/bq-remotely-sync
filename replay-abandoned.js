@@ -32,12 +32,23 @@ const DATASET_CONFIG = {
     typeValue: "PPE",
     hasImage: true,
     selectFields: [
-      "id", "branch_id", "camera_id", "ppe_person_id", "violation_type",
-      "violation_time", "confidence", "snapshot", "snapshot_url",
+      "id",
+      "branch_id",
+      "camera_id",
+      "ppe_person_id",
+      "violation_type",
+      "violation_time",
+      "confidence",
+      "snapshot",
+      "snapshot_url",
     ],
     extraFields: [
-      "ppe_person_id", "violation_type", "confidence", "snapshot",
-      "camera_id", "branch_id",
+      "ppe_person_id",
+      "violation_type",
+      "confidence",
+      "snapshot",
+      "camera_id",
+      "branch_id",
     ],
   },
   footfall: {
@@ -46,7 +57,14 @@ const DATASET_CONFIG = {
     timeField: "event_time",
     typeValue: "FOOTFALL",
     hasImage: false,
-    selectFields: ["id", "branch_id", "camera_id", "track_id", "direction", "event_time"],
+    selectFields: [
+      "id",
+      "branch_id",
+      "camera_id",
+      "track_id",
+      "direction",
+      "event_time",
+    ],
     extraFields: ["track_id", "direction", "camera_id", "branch_id"],
   },
   heatmap: {
@@ -55,9 +73,27 @@ const DATASET_CONFIG = {
     timeField: "event_time",
     typeValue: "HEATMAP",
     hasImage: false,
-    selectFields: ["id", "branch_id", "camera_id", "x", "y", "track_id", "event_time"],
+    selectFields: [
+      "id",
+      "branch_id",
+      "camera_id",
+      "x",
+      "y",
+      "track_id",
+      "event_time",
+    ],
     extraFields: ["x", "y", "track_id", "camera_id", "branch_id"],
   },
+  staff_occupancy: {
+    // <-- ADD THIS
+    tableId: "namaq_staff_occupancy", // <-- ADD THIS
+    auditCollection: "sync_audit_staff_occupancy", // <-- ADD THIS
+    timeField: "event_time", // <-- ADD THIS
+    typeValue: "STAFF_OCCUPANCY", // <-- ADD THIS
+    hasImage: false, // <-- ADD THIS
+    selectFields: ["id", "branch_id", "camera_id", "staff_count", "event_time"], // <-- ADD THIS
+    extraFields: ["staff_count", "camera_id", "branch_id"], // <-- ADD THIS
+  }, // <-- ADD THIS
 };
 
 const ROW_ID = process.argv[2];

@@ -45,12 +45,23 @@ const DATASET_CONFIG = {
     typeValue: "PPE",
     hasImage: true,
     selectFields: [
-      "id", "branch_id", "camera_id", "ppe_person_id", "violation_type",
-      "violation_time", "confidence", "snapshot", "snapshot_url",
+      "id",
+      "branch_id",
+      "camera_id",
+      "ppe_person_id",
+      "violation_type",
+      "violation_time",
+      "confidence",
+      "snapshot",
+      "snapshot_url",
     ],
     extraFields: [
-      "ppe_person_id", "violation_type", "confidence", "snapshot",
-      "camera_id", "branch_id",
+      "ppe_person_id",
+      "violation_type",
+      "confidence",
+      "snapshot",
+      "camera_id",
+      "branch_id",
     ],
   },
   footfall: {
@@ -60,7 +71,14 @@ const DATASET_CONFIG = {
     timeField: "event_time",
     typeValue: "FOOTFALL",
     hasImage: false,
-    selectFields: ["id", "branch_id", "camera_id", "track_id", "direction", "event_time"],
+    selectFields: [
+      "id",
+      "branch_id",
+      "camera_id",
+      "track_id",
+      "direction",
+      "event_time",
+    ],
     extraFields: ["track_id", "direction", "camera_id", "branch_id"],
   },
   heatmap: {
@@ -70,9 +88,28 @@ const DATASET_CONFIG = {
     timeField: "event_time",
     typeValue: "HEATMAP",
     hasImage: false,
-    selectFields: ["id", "branch_id", "camera_id", "x", "y", "track_id", "event_time"],
+    selectFields: [
+      "id",
+      "branch_id",
+      "camera_id",
+      "x",
+      "y",
+      "track_id",
+      "event_time",
+    ],
     extraFields: ["x", "y", "track_id", "camera_id", "branch_id"],
   },
+  staff_occupancy: {
+    // <-- ADD THIS
+    tableId: "namaq_staff_occupancy", // <-- ADD THIS
+    stateDocPath: "pipeline_state/staff_occupancy_job", // <-- ADD THIS
+    auditCollection: "sync_audit_staff_occupancy", // <-- ADD THIS
+    timeField: "event_time", // <-- ADD THIS
+    typeValue: "STAFF_OCCUPANCY", // <-- ADD THIS
+    hasImage: false, // <-- ADD THIS
+    selectFields: ["id", "branch_id", "camera_id", "staff_count", "event_time"], // <-- ADD THIS
+    extraFields: ["staff_count", "camera_id", "branch_id"], // <-- ADD THIS
+  }, // <-- ADD THIS
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -84,10 +121,14 @@ exports.processNewRows = async (req, res) => {
     const config = DATASET_CONFIG[mode];
 
     if (!config) {
-      return res.status(400).send(`Invalid mode. Use: ${Object.keys(DATASET_CONFIG).join(" | ")}`);
+      return res
+        .status(400)
+        .send(`Invalid mode. Use: ${Object.keys(DATASET_CONFIG).join(" | ")}`);
     }
 
-    console.log(`🚀 Starting ${mode.toUpperCase()} sync from ${config.tableId}...`);
+    console.log(
+      `🚀 Starting ${mode.toUpperCase()} sync from ${config.tableId}...`,
+    );
 
     const watermark = await getWatermark(config.stateDocPath);
     console.log(`📅 Watermark: ${watermark}`);
@@ -107,7 +148,9 @@ exports.processNewRows = async (req, res) => {
     console.log(`📊 Found ${rows.length} rows.`);
     if (rows.length === 0) return res.status(200).send("No new rows.");
 
-    let succeeded = 0, abandoned = 0, pendingRetry = 0;
+    let succeeded = 0,
+      abandoned = 0,
+      pendingRetry = 0;
 
     for (const row of rows) {
       const result = await processRow(row, config);
@@ -126,9 +169,11 @@ exports.processNewRows = async (req, res) => {
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
 
-    return res.status(200).send(
-      `✅ ${mode.toUpperCase()} Processed: ${succeeded} ok, ${abandoned} abandoned, ${pendingRetry} pending-retry.`
-    );
+    return res
+      .status(200)
+      .send(
+        `✅ ${mode.toUpperCase()} Processed: ${succeeded} ok, ${abandoned} abandoned, ${pendingRetry} pending-retry.`,
+      );
   } catch (err) {
     console.error("❌ Fatal error:", err);
     return res.status(500).send("Internal Server Error");
@@ -157,7 +202,8 @@ async function processRow(row, config) {
     return "SUCCESS";
   } catch (error) {
     const httpStatus = error.response?.status;
-    const isGcsNotFound = error.message && error.message.includes("No such object");
+    const isGcsNotFound =
+      error.message && error.message.includes("No such object");
     const isPermanent =
       error.isPermanent === true ||
       isGcsNotFound ||
@@ -184,9 +230,18 @@ async function processRow(row, config) {
       error: sanitizeError(error),
     });
     if (attemptCount === WARN_AFTER_ATTEMPTS) {
-      await sendSlack("warning", row, config, error, "multiple_failures", attemptCount);
+      await sendSlack(
+        "warning",
+        row,
+        config,
+        error,
+        "multiple_failures",
+        attemptCount,
+      );
     }
-    console.log(`  ↻ Transient failure (attempt ${attemptCount}/${MAX_ATTEMPTS}).`);
+    console.log(
+      `  ↻ Transient failure (attempt ${attemptCount}/${MAX_ATTEMPTS}).`,
+    );
     return "RETRY_PENDING";
   }
 }
@@ -229,7 +284,9 @@ async function deliverRow(row, config) {
 // ═══════════════════════════════════════════════════════════════════════
 async function uploadFile(snapshotUrl) {
   const url = `${BASE_URL}/services/eye/api/v2/webhooks/files`;
-  const parts = snapshotUrl.replace("https://storage.googleapis.com/", "").split("/");
+  const parts = snapshotUrl
+    .replace("https://storage.googleapis.com/", "")
+    .split("/");
   const bucketName = parts.shift();
   const fileName = parts.join("/");
   const original = fileName.split("/").pop();
@@ -244,7 +301,11 @@ async function uploadFile(snapshotUrl) {
   });
 
   const res = await axios.post(url, form, {
-    headers: { ...form.getHeaders(), "x-client-key": CLIENT_KEY, edgeId: EDGE_ID },
+    headers: {
+      ...form.getHeaders(),
+      "x-client-key": CLIENT_KEY,
+      edgeId: EDGE_ID,
+    },
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
   });
@@ -267,7 +328,11 @@ async function createViolation(payload) {
 // ═══════════════════════════════════════════════════════════════════════
 // AUDIT (now takes config + auditCollection)
 // ═══════════════════════════════════════════════════════════════════════
-async function writeAudit(row, config, { status, attemptCount, error = null, ...rest }) {
+async function writeAudit(
+  row,
+  config,
+  { status, attemptCount, error = null, ...rest },
+) {
   const ref = firestore.collection(config.auditCollection).doc(row.id);
   const existing = await ref.get();
 
@@ -298,16 +363,26 @@ function sanitizeError(error) {
     message: error.message || "Unknown error",
     stage: error.stage || null,
     httpStatus: error.response?.status || null,
-    errorCode: error.response?.data?.code || error.response?.data?.errorCode || null,
+    errorCode:
+      error.response?.data?.code || error.response?.data?.errorCode || null,
     endpoint: error.config?.url || null,
-    responseBody: error.response?.data ? JSON.stringify(error.response.data).substring(0, 2000) : null,
+    responseBody: error.response?.data
+      ? JSON.stringify(error.response.data).substring(0, 2000)
+      : null,
   };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // SLACK
 // ═══════════════════════════════════════════════════════════════════════
-async function sendSlack(severity, row, config, error, reason, attemptCount = null) {
+async function sendSlack(
+  severity,
+  row,
+  config,
+  error,
+  reason,
+  attemptCount = null,
+) {
   if (!SLACK_WEBHOOK_URL) {
     console.log(`  [Slack disabled] ${severity}: ${row.id} — ${reason}`);
     return;
@@ -322,18 +397,40 @@ async function sendSlack(severity, row, config, error, reason, attemptCount = nu
     { title: "Row ID", value: row.id, short: true },
     { title: "Module", value: config.typeValue, short: true },
     { title: "Type", value: config.typeValue, short: true },
-    { title: "Detected", value: toIsoTimestamp(row[config.timeField]), short: true },
+    {
+      title: "Detected",
+      value: toIsoTimestamp(row[config.timeField]),
+      short: true,
+    },
   ];
   if (error) {
-    fields.push({ title: "Stage", value: error.stage || "unknown", short: true });
-    fields.push({ title: "HTTP", value: String(error.response?.status || "N/A"), short: true });
-    fields.push({ title: "Error", value: (error.message || "").substring(0, 300), short: false });
+    fields.push({
+      title: "Stage",
+      value: error.stage || "unknown",
+      short: true,
+    });
+    fields.push({
+      title: "HTTP",
+      value: String(error.response?.status || "N/A"),
+      short: true,
+    });
+    fields.push({
+      title: "Error",
+      value: (error.message || "").substring(0, 300),
+      short: false,
+    });
   }
   try {
-    await axios.post(SLACK_WEBHOOK_URL, {
-      text: `${emoji} *${titleMap[reason] || reason}* — Row \`${row.id}\``,
-      attachments: [{ color: severity === "critical" ? "#D93F3F" : "#F2C744", fields }],
-    }, { timeout: 5000 });
+    await axios.post(
+      SLACK_WEBHOOK_URL,
+      {
+        text: `${emoji} *${titleMap[reason] || reason}* — Row \`${row.id}\``,
+        attachments: [
+          { color: severity === "critical" ? "#D93F3F" : "#F2C744", fields },
+        ],
+      },
+      { timeout: 5000 },
+    );
   } catch (err) {
     console.error("Slack failed:", err.message);
   }
@@ -347,7 +444,10 @@ async function getWatermark(stateDocPath) {
   const doc = await ref.get();
   if (!doc.exists) {
     const initial = "1970-01-01T00:00:00.000Z";
-    await ref.set({ lastProcessedTimestamp: initial, updatedAt: new Date().toISOString() });
+    await ref.set({
+      lastProcessedTimestamp: initial,
+      updatedAt: new Date().toISOString(),
+    });
     return initial;
   }
   const stored = doc.data().lastProcessedTimestamp;
@@ -357,11 +457,16 @@ async function getWatermark(stateDocPath) {
 }
 
 async function setWatermark(stateDocPath, timestamp) {
-  const iso = typeof timestamp === "string" ? timestamp : new Date(timestamp).toISOString();
-  await firestore.doc(stateDocPath).set(
-    { lastProcessedTimestamp: iso, updatedAt: new Date().toISOString() },
-    { merge: true }
-  );
+  const iso =
+    typeof timestamp === "string"
+      ? timestamp
+      : new Date(timestamp).toISOString();
+  await firestore
+    .doc(stateDocPath)
+    .set(
+      { lastProcessedTimestamp: iso, updatedAt: new Date().toISOString() },
+      { merge: true },
+    );
   console.log(`💾 Watermark → ${iso}`);
 }
 
@@ -370,7 +475,11 @@ async function setWatermark(stateDocPath, timestamp) {
 // ═══════════════════════════════════════════════════════════════════════
 function toIsoTimestamp(rawValue) {
   if (rawValue == null) throw new Error("Timestamp is null");
-  if (typeof rawValue === "object" && !(rawValue instanceof Date) && "value" in rawValue) {
+  if (
+    typeof rawValue === "object" &&
+    !(rawValue instanceof Date) &&
+    "value" in rawValue
+  ) {
     return toIsoTimestamp(rawValue.value);
   }
   if (rawValue instanceof Date) return rawValue.toISOString();
