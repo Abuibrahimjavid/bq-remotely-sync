@@ -38,6 +38,7 @@ const PERMANENT_HTTP_STATUSES = [400, 401, 403, 404, 405, 410, 422];
 // ═══════════════════════════════════════════════════════════════════════
 const DATASET_CONFIG = {
   ppe: {
+    source: "bigquery",
     tableId: "namaq_ppe",
     stateDocPath: "pipeline_state/ppe_job",
     auditCollection: "sync_audit_ppe",
@@ -60,11 +61,12 @@ const DATASET_CONFIG = {
       "violation_type",
       "confidence",
       "snapshot",
-      "camera_id",
+      { from: "camera_id", to: "zone_id" },
       "branch_id",
     ],
   },
   footfall: {
+    source: "bigquery",
     tableId: "namaq_footfall",
     stateDocPath: "pipeline_state/footfall_job",
     auditCollection: "sync_audit_footfall",
@@ -79,9 +81,15 @@ const DATASET_CONFIG = {
       "direction",
       "event_time",
     ],
-    extraFields: ["track_id", "direction", "camera_id", "branch_id"],
+    extraFields: [
+      "track_id",
+      "direction",
+      { from: "camera_id", to: "zone_id" },
+      "branch_id",
+    ],
   },
   heatmap: {
+    source: "bigquery",
     tableId: "namaq_heatmap",
     stateDocPath: "pipeline_state/heatmap_job",
     auditCollection: "sync_audit_heatmap",
@@ -97,19 +105,47 @@ const DATASET_CONFIG = {
       "track_id",
       "event_time",
     ],
-    extraFields: ["x", "y", "track_id", "camera_id", "branch_id"],
+    // camera_id is renamed to zone_id in the extra payload for heatmap
+    extraFields: [
+      "x",
+      "y",
+      "track_id",
+      { from: "camera_id", to: "zone_id" },
+      "branch_id",
+    ],
   },
   staff_occupancy: {
-    // <-- ADD THIS
-    tableId: "namaq_staff_occupancy", // <-- ADD THIS
-    stateDocPath: "pipeline_state/staff_occupancy_job", // <-- ADD THIS
-    auditCollection: "sync_audit_staff_occupancy", // <-- ADD THIS
-    timeField: "event_time", // <-- ADD THIS
-    typeValue: "STAFF_OCCUPANCY", // <-- ADD THIS
-    hasImage: false, // <-- ADD THIS
-    selectFields: ["id", "branch_id", "camera_id", "staff_count", "event_time"], // <-- ADD THIS
-    extraFields: ["staff_count", "camera_id", "branch_id"], // <-- ADD THIS
-  }, // <-- ADD THIS
+    source: "bigquery",
+    tableId: "namaq_staff_occupancy",
+    stateDocPath: "pipeline_state/staff_occupancy_job",
+    auditCollection: "sync_audit_staff_occupancy",
+    timeField: "event_time",
+    typeValue: "STAFF_OCCUPANCY",
+    hasImage: false,
+    selectFields: ["id", "branch_id", "camera_id", "staff_count", "event_time"],
+    extraFields: [
+      "staff_count",
+      { from: "camera_id", to: "zone_id" },
+      "branch_id",
+    ],
+  },
+  heatmap_frames: {
+    source: "gcs",
+    stateDocPath: "pipeline_state/heatmap_frames_job",
+    auditCollection: "sync_audit_heatmap_frames",
+    typeValue: "HEATMAP_FRAME",
+    branchId: "4381",
+    frames: [
+      {
+        zoneId: "03",
+        url: "https://storage.googleapis.com/si-heatmap-frames/namqcafe_heatmap_frames/03.jpg",
+      },
+      {
+        zoneId: "08",
+        url: "https://storage.googleapis.com/si-heatmap-frames/namqcafe_heatmap_frames/08.jpg",
+      },
+    ],
+  },
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -124,6 +160,11 @@ exports.processNewRows = async (req, res) => {
       return res
         .status(400)
         .send(`Invalid mode. Use: ${Object.keys(DATASET_CONFIG).join(" | ")}`);
+    }
+
+    // GCS source (daily frame uploads) — bypasses the BigQuery flow entirely
+    if (config.source === "gcs") {
+      return await processGcsFrames(mode, config, res);
     }
 
     console.log(
@@ -179,6 +220,92 @@ exports.processNewRows = async (req, res) => {
     return res.status(500).send("Internal Server Error");
   }
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// GCS FRAME PROCESSING (daily reference image upload)
+// ═══════════════════════════════════════════════════════════════════════
+async function processGcsFrames(mode, config, res) {
+  const todayUtc = dayjs.utc().format("YYYY-MM-DD");
+
+  // Check Firestore: already uploaded today?
+  const stateRef = firestore.doc(config.stateDocPath);
+  const stateDoc = await stateRef.get();
+  const lastDate = stateDoc.exists ? stateDoc.data().lastFrameDate : null;
+
+  if (lastDate === todayUtc) {
+    console.log(`⏭ Frames already uploaded today (${todayUtc}). Skipping.`);
+    return res.status(200).send(`Frames already uploaded for ${todayUtc}.`);
+  }
+
+  console.log(`🚀 Starting ${mode.toUpperCase()} upload for ${todayUtc}...`);
+
+  let succeeded = 0,
+    abandoned = 0;
+
+  for (const frame of config.frames) {
+    const docId = `frame_${frame.zoneId}_${todayUtc}`;
+    console.log(`🔹 Frame ${frame.zoneId} — ${frame.url}`);
+
+    try {
+      const fileId = await uploadFile(frame.url);
+      console.log(`  ✓ Uploaded: ${fileId}`);
+
+      await createViolation({
+        cameraId: EDGE_ID,
+        type: config.typeValue,
+        detectedAt: new Date().toISOString(),
+        fileId: fileId,
+        extra: [
+          {
+            id: docId,
+            zone_id: frame.zoneId,
+            branch_id: config.branchId,
+          },
+        ],
+      });
+      console.log(`  ✓ ${config.typeValue} frame created.`);
+
+      await writeAudit({ id: docId }, config, {
+        status: "SUCCESS",
+        attemptCount: 1,
+        resolvedAt: new Date().toISOString(),
+        error: null,
+        zoneId: frame.zoneId,
+      });
+      succeeded++;
+    } catch (err) {
+      console.error(`  ⛔ Frame ${frame.zoneId} failed: ${err.message}`);
+      await writeAudit({ id: docId }, config, {
+        status: "ABANDONED",
+        attemptCount: 1,
+        abandonedAt: new Date().toISOString(),
+        error: sanitizeError(err),
+        abandonReason: "permanent_error",
+        zoneId: frame.zoneId,
+      });
+      abandoned++;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  // Mark today as complete only if all frames succeeded
+  if (abandoned === 0) {
+    await stateRef.set(
+      { lastFrameDate: todayUtc, updatedAt: new Date().toISOString() },
+      { merge: true },
+    );
+    console.log(`💾 Marked ${todayUtc} as complete.`);
+  } else {
+    console.log(`⚠️ Some frames failed — will retry next run.`);
+  }
+
+  return res
+    .status(200)
+    .send(
+      `✅ ${mode.toUpperCase()} Processed: ${succeeded} ok, ${abandoned} abandoned.`,
+    );
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // ROW PROCESSING
@@ -264,7 +391,11 @@ async function deliverRow(row, config) {
 
   const extraPayload = { id: row.id };
   for (const field of config.extraFields) {
-    extraPayload[field] = row[field];
+    if (typeof field === "string") {
+      extraPayload[field] = row[field];
+    } else if (field && field.from && field.to) {
+      extraPayload[field.to] = row[field.from];
+    }
   }
 
   const payload = {
@@ -280,7 +411,7 @@ async function deliverRow(row, config) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// API CALLS (unchanged)
+// API CALLS
 // ═══════════════════════════════════════════════════════════════════════
 async function uploadFile(snapshotUrl) {
   const url = `${BASE_URL}/services/eye/api/v2/webhooks/files`;
@@ -326,7 +457,7 @@ async function createViolation(payload) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// AUDIT (now takes config + auditCollection)
+// AUDIT
 // ═══════════════════════════════════════════════════════════════════════
 async function writeAudit(
   row,
@@ -336,12 +467,19 @@ async function writeAudit(
   const ref = firestore.collection(config.auditCollection).doc(row.id);
   const existing = await ref.get();
 
+  // Compute detectedAt safely (frames config has no timeField)
+  const detectedAt =
+    (config.timeField &&
+      row[config.timeField] &&
+      toIsoTimestamp(row[config.timeField])) ||
+    new Date().toISOString();
+
   const data = {
     rowId: row.id,
-    cameraId: row.camera_id,
+    cameraId: row.camera_id ?? null,
     moduleType: config.typeValue,
-    detectedAt: toIsoTimestamp(row[config.timeField]),
-    branchId: row.branch_id,
+    detectedAt,
+    branchId: row.branch_id ?? config.branchId ?? null,
     status,
     attemptCount,
     error,
@@ -397,11 +535,6 @@ async function sendSlack(
     { title: "Row ID", value: row.id, short: true },
     { title: "Module", value: config.typeValue, short: true },
     { title: "Type", value: config.typeValue, short: true },
-    {
-      title: "Detected",
-      value: toIsoTimestamp(row[config.timeField]),
-      short: true,
-    },
   ];
   if (error) {
     fields.push({
@@ -437,7 +570,7 @@ async function sendSlack(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// WATERMARK (now takes doc path)
+// WATERMARK
 // ═══════════════════════════════════════════════════════════════════════
 async function getWatermark(stateDocPath) {
   const ref = firestore.doc(stateDocPath);

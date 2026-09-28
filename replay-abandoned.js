@@ -26,6 +26,7 @@ const BASE_URL = process.env.BASE_URL;
 // ═══════════════════════════════════════════════════════════════════════
 const DATASET_CONFIG = {
   ppe: {
+    source: "bigquery",
     tableId: "namaq_ppe",
     auditCollection: "sync_audit_ppe",
     timeField: "violation_time",
@@ -47,11 +48,12 @@ const DATASET_CONFIG = {
       "violation_type",
       "confidence",
       "snapshot",
-      "camera_id",
+      { from: "camera_id", to: "zone_id" },
       "branch_id",
     ],
   },
   footfall: {
+    source: "bigquery",
     tableId: "namaq_footfall",
     auditCollection: "sync_audit_footfall",
     timeField: "event_time",
@@ -65,9 +67,15 @@ const DATASET_CONFIG = {
       "direction",
       "event_time",
     ],
-    extraFields: ["track_id", "direction", "camera_id", "branch_id"],
+    extraFields: [
+      "track_id",
+      "direction",
+      { from: "camera_id", to: "zone_id" },
+      "branch_id",
+    ],
   },
   heatmap: {
+    source: "bigquery",
     tableId: "namaq_heatmap",
     auditCollection: "sync_audit_heatmap",
     timeField: "event_time",
@@ -82,18 +90,44 @@ const DATASET_CONFIG = {
       "track_id",
       "event_time",
     ],
-    extraFields: ["x", "y", "track_id", "camera_id", "branch_id"],
+    extraFields: [
+      "x",
+      "y",
+      "track_id",
+      { from: "camera_id", to: "zone_id" },
+      "branch_id",
+    ],
   },
   staff_occupancy: {
-    // <-- ADD THIS
-    tableId: "namaq_staff_occupancy", // <-- ADD THIS
-    auditCollection: "sync_audit_staff_occupancy", // <-- ADD THIS
-    timeField: "event_time", // <-- ADD THIS
-    typeValue: "STAFF_OCCUPANCY", // <-- ADD THIS
-    hasImage: false, // <-- ADD THIS
-    selectFields: ["id", "branch_id", "camera_id", "staff_count", "event_time"], // <-- ADD THIS
-    extraFields: ["staff_count", "camera_id", "branch_id"], // <-- ADD THIS
-  }, // <-- ADD THIS
+    source: "bigquery",
+    tableId: "namaq_staff_occupancy",
+    auditCollection: "sync_audit_staff_occupancy",
+    timeField: "event_time",
+    typeValue: "STAFF_OCCUPANCY",
+    hasImage: false,
+    selectFields: ["id", "branch_id", "camera_id", "staff_count", "event_time"],
+    extraFields: [
+      "staff_count",
+      { from: "camera_id", to: "zone_id" },
+      "branch_id",
+    ],
+  },
+  heatmap_frames: {
+    source: "gcs",
+    auditCollection: "sync_audit_heatmap_frames",
+    typeValue: "HEATMAP_FRAME",
+    branchId: "4381",
+    frames: [
+      {
+        zoneId: "03",
+        url: "https://storage.googleapis.com/si-heatmap-frames/namqcafe_heatmap_frames/03.jpg",
+      },
+      {
+        zoneId: "08",
+        url: "https://storage.googleapis.com/si-heatmap-frames/namqcafe_heatmap_frames/08.jpg",
+      },
+    ],
+  },
 };
 
 const ROW_ID = process.argv[2];
@@ -102,14 +136,23 @@ const MODE = (process.argv[3] || "").toLowerCase();
 async function main() {
   if (!ROW_ID || !MODE) {
     console.error("Usage: node replay-abandoned.js <rowId> <mode>");
-    console.error("Modes: ppe | footfall | heatmap");
+    console.error(
+      "Modes: ppe | footfall | heatmap | staff_occupancy | heatmap_frames",
+    );
     process.exit(1);
   }
 
   const config = DATASET_CONFIG[MODE];
   if (!config) {
-    console.error(`Invalid mode "${MODE}". Use: ppe | footfall | heatmap`);
+    console.error(
+      `Invalid mode "${MODE}". Use: ppe | footfall | heatmap | staff_occupancy | heatmap_frames`,
+    );
     process.exit(1);
+  }
+
+  // GCS-sourced modes (frames) take a different replay path
+  if (config.source === "gcs") {
+    return await replayGcsFrame(ROW_ID, config);
   }
 
   const auditRef = firestore.collection(config.auditCollection).doc(ROW_ID);
@@ -158,7 +201,11 @@ async function main() {
 
     const extraPayload = { id: row.id };
     for (const field of config.extraFields) {
-      extraPayload[field] = row[field];
+      if (typeof field === "string") {
+        extraPayload[field] = row[field];
+      } else if (field && field.from && field.to) {
+        extraPayload[field.to] = row[field.from];
+      }
     }
 
     await createViolation({
@@ -169,6 +216,88 @@ async function main() {
       extra: [extraPayload],
     });
     console.log(`  ✓ ${config.typeValue} violation created.`);
+
+    await auditRef.set(
+      {
+        status: "SUCCESS",
+        resolvedAt: new Date().toISOString(),
+        resolvedBy: "manual_replay",
+        error: null,
+      },
+      { merge: true },
+    );
+
+    console.log(`✅ Row ${ROW_ID} marked SUCCESS.`);
+  } catch (err) {
+    console.error(`❌ Replay failed: ${err.message}`);
+    await auditRef.set(
+      {
+        status: "ABANDONED",
+        error: {
+          message: err.message,
+          httpStatus: err.response?.status || null,
+        },
+        abandonReason: "manual_replay_failed",
+        lastAttemptAt: new Date().toISOString(),
+      },
+      { merge: true },
+    );
+    process.exit(1);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// GCS FRAME REPLAY
+// ═══════════════════════════════════════════════════════════════════════
+async function replayGcsFrame(ROW_ID, config) {
+  const auditRef = firestore.collection(config.auditCollection).doc(ROW_ID);
+  const auditDoc = await auditRef.get();
+  if (!auditDoc.exists) {
+    console.error(`No audit record for ${ROW_ID} in ${config.auditCollection}`);
+    process.exit(1);
+  }
+
+  const audit = auditDoc.data();
+  if (audit.status !== "ABANDONED") {
+    console.error(`Row is "${audit.status}", not ABANDONED. Nothing to do.`);
+    process.exit(1);
+  }
+
+  // Parse zoneId from doc id: "frame_<zoneId>_<date>"
+  const parts = ROW_ID.split("_");
+  if (parts.length < 3 || parts[0] !== "frame") {
+    console.error(
+      `Cannot parse frame id "${ROW_ID}". Expected format: frame_<zoneId>_<date>`,
+    );
+    process.exit(1);
+  }
+  const zoneId = parts[1];
+  const frame = config.frames.find((f) => f.zoneId === zoneId);
+  if (!frame) {
+    console.error(`No frame config for zoneId "${zoneId}"`);
+    process.exit(1);
+  }
+
+  console.log(`Replaying ${config.typeValue} frame zone ${zoneId}...`);
+
+  try {
+    const fileId = await uploadFile(frame.url);
+    console.log(`  ✓ Uploaded: ${fileId}`);
+
+    await createViolation({
+      cameraId: EDGE_ID,
+      type: config.typeValue,
+      detectedAt: new Date().toISOString(),
+      fileId: fileId,
+      extra: [
+        {
+          id: ROW_ID,
+          zone_id: frame.zoneId,
+          branch_id: config.branchId,
+        },
+      ],
+    });
+    console.log(`  ✓ ${config.typeValue} frame created.`);
 
     await auditRef.set(
       {
