@@ -180,7 +180,7 @@ async function deliverRow(row) {
   console.log(`  ✓ Uploaded: ${fileId}`);
 
   const payload = {
-    cameraId: row.camera_id,
+    cameraId: EDGE_ID, // <-- Use EDGE_ID instead of row.camera_id
     type: row.violation_type,
     detectedAt: toIsoTimestamp(row.violation_time),
     fileId,

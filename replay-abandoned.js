@@ -69,7 +69,7 @@ async function main() {
     console.log(`  ✓ Uploaded: ${fileId}`);
 
     await createViolation({
-      cameraId: row.camera_id,
+      cameraId: EDGE_ID,
       type: row.violation_type,
       detectedAt: toIsoTimestamp(row.violation_time),
       fileId,
