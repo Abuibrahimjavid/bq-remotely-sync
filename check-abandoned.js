@@ -8,6 +8,7 @@ const COLLECTIONS = [
   "sync_audit_footfall",
   "sync_audit_heatmap",
   "sync_audit_staff_occupancy",
+  "sync_audit_table_cleaning",
   "sync_audit_heatmap_frames",
 ];
 

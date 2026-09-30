@@ -8,6 +8,7 @@ const JOBS = [
   "footfall_job",
   "heatmap_job",
   "staff_occupancy_job",
+  "table_cleaning_job",
   "heatmap_frames_job",
 ];
 
