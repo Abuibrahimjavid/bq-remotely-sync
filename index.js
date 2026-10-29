@@ -200,19 +200,22 @@ exports.processNewRows = async (req, res) => {
       `🚀 Starting ${mode.toUpperCase()} sync from ${config.tableId}...`,
     );
 
-    const watermark = await getWatermark(config.stateDocPath);
-    console.log(`📅 Watermark: ${watermark}`);
+    const watermarkMicros = await getWatermark(config.stateDocPath);
+    console.log(`📅 Watermark: ${microsToIso(watermarkMicros)} (${watermarkMicros} µs)`);
 
+    // BigQuery TIMESTAMPs carry microseconds; JS Dates only carry milliseconds.
+    // The cursor is compared in microseconds so the last row is not re-read.
     const selectList = config.selectFields.join(", ");
     const [rows] = await bigquery.query({
       query: `
-        SELECT ${selectList}
+        SELECT ${selectList}, UNIX_MICROS(${config.timeField}) AS _cursor_micros
         FROM \`${PROJECT_ID}.${DATASET_ID}.${config.tableId}\`
-        WHERE ${config.timeField} > @watermark
+        WHERE ${config.timeField} > TIMESTAMP_MICROS(@watermarkMicros)
         ORDER BY ${config.timeField} ASC
         LIMIT 50
       `,
-      params: { watermark: new Date(watermark) },
+      params: { watermarkMicros },
+      types: { watermarkMicros: "INT64" },
     });
 
     console.log(`📊 Found ${rows.length} rows.`);
@@ -222,14 +225,16 @@ exports.processNewRows = async (req, res) => {
       abandoned = 0,
       pendingRetry = 0;
 
+    let skipped = 0;
+
     for (const row of rows) {
       const result = await processRow(row, config);
-      const isoTime = toIsoTimestamp(row[config.timeField]);
 
-      if (result === "SUCCESS" || result === "ABANDONED") {
-        await setWatermark(config.stateDocPath, isoTime);
+      if (result === "SUCCESS" || result === "ABANDONED" || result === "SKIPPED") {
+        await setWatermark(config.stateDocPath, Number(row._cursor_micros));
         if (result === "SUCCESS") succeeded++;
-        else abandoned++;
+        else if (result === "ABANDONED") abandoned++;
+        else skipped++;
       } else if (result === "RETRY_PENDING") {
         pendingRetry++;
         console.log(`  ⏸ Row ${row.id} pending retry. Stopping batch.`);
@@ -242,7 +247,7 @@ exports.processNewRows = async (req, res) => {
     return res
       .status(200)
       .send(
-        `✅ ${mode.toUpperCase()} Processed: ${succeeded} ok, ${abandoned} abandoned, ${pendingRetry} pending-retry.`,
+        `✅ ${mode.toUpperCase()} Processed: ${succeeded} ok, ${abandoned} abandoned, ${skipped} already-done, ${pendingRetry} pending-retry.`,
       );
   } catch (err) {
     console.error("❌ Fatal error:", err);
@@ -343,6 +348,14 @@ async function processRow(row, config) {
   console.log(`🔹 Row ${row.id}`);
 
   const existingAudit = await getAuditDoc(config.auditCollection, row.id);
+
+  // Idempotency guard: never re-send a row that already reached a final state.
+  // ABANDONED rows are re-driven only via replay-abandoned.js.
+  if (existingAudit?.status === "SUCCESS" || existingAudit?.status === "ABANDONED") {
+    console.log(`  ⏭ Already ${existingAudit.status}, skipping delivery.`);
+    return "SKIPPED";
+  }
+
   const previousAttempts = existingAudit?.attemptCount || 0;
   const attemptCount = previousAttempts + 1;
 
@@ -601,35 +614,43 @@ async function sendSlack(
 // ═══════════════════════════════════════════════════════════════════════
 // WATERMARK
 // ═══════════════════════════════════════════════════════════════════════
+// Returns the watermark as integer microseconds since epoch.
 async function getWatermark(stateDocPath) {
   const ref = firestore.doc(stateDocPath);
   const doc = await ref.get();
   if (!doc.exists) {
-    const initial = "1970-01-01T00:00:00.000Z";
     await ref.set({
-      lastProcessedTimestamp: initial,
+      lastProcessedTimestamp: microsToIso(0),
+      lastProcessedMicros: "0",
       updatedAt: new Date().toISOString(),
     });
-    return initial;
+    return 0;
   }
-  const stored = doc.data().lastProcessedTimestamp;
-  if (typeof stored === "string") return stored;
-  if (stored?.toDate) return stored.toDate().toISOString();
-  return new Date(stored).toISOString();
+  const data = doc.data();
+  if (data.lastProcessedMicros != null) return Number(data.lastProcessedMicros);
+
+  // Legacy millisecond watermark: the row at that exact ms will be re-read
+  // once and then skipped by the idempotency guard in processRow.
+  const stored = data.lastProcessedTimestamp;
+  const ms = stored?.toDate ? stored.toDate().getTime() : new Date(stored).getTime();
+  return ms * 1000;
 }
 
-async function setWatermark(stateDocPath, timestamp) {
-  const iso =
-    typeof timestamp === "string"
-      ? timestamp
-      : new Date(timestamp).toISOString();
-  await firestore
-    .doc(stateDocPath)
-    .set(
-      { lastProcessedTimestamp: iso, updatedAt: new Date().toISOString() },
-      { merge: true },
-    );
-  console.log(`💾 Watermark → ${iso}`);
+async function setWatermark(stateDocPath, micros) {
+  const iso = microsToIso(micros);
+  await firestore.doc(stateDocPath).set(
+    {
+      lastProcessedTimestamp: iso, // human-readable, ms precision
+      lastProcessedMicros: String(micros), // authoritative cursor
+      updatedAt: new Date().toISOString(),
+    },
+    { merge: true },
+  );
+  console.log(`💾 Watermark → ${iso} (${micros} µs)`);
+}
+
+function microsToIso(micros) {
+  return new Date(Math.floor(micros / 1000)).toISOString();
 }
 
 // ═══════════════════════════════════════════════════════════════════════
